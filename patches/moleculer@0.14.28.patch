@@ -1,0 +1,176 @@
+diff --git a/index.d.ts b/index.d.ts
+index 1ad8b61e03a4154226e4af6f0f57f5ae0a1f18b8..8447d427a972460424325788b599e571495d13f1 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -721,7 +721,11 @@ declare namespace Moleculer {
+ 		version?: string | number;
+ 	}
+ 
+-	type StartedStoppedHandler = () => Promise<void[]> | Promise<void> | void;
++	type ServiceSyncLifecycleHandler<S = ServiceSettingSchema> = (this: Service<S>) => void;
++	type ServiceAsyncLifecycleHandler<S = ServiceSettingSchema> = (
++		this: Service<S>,
++	) => void | Promise<void>;
++
+ 	interface ServiceSchema<S = ServiceSettingSchema> {
+ 		name: string;
+ 		version?: string | number;
+@@ -734,9 +738,9 @@ declare namespace Moleculer {
+ 		hooks?: ServiceHooks;
+ 
+ 		events?: ServiceEvents;
+-		created?: (() => void) | (() => void)[];
+-		started?: StartedStoppedHandler | StartedStoppedHandler[];
+-		stopped?: StartedStoppedHandler | StartedStoppedHandler[];
++		created?: ServiceSyncLifecycleHandler<S> | ServiceSyncLifecycleHandler<S>[];
++		started?: ServiceAsyncLifecycleHandler<S> | ServiceAsyncLifecycleHandler<S>[];
++		stopped?: ServiceAsyncLifecycleHandler<S> | ServiceAsyncLifecycleHandler<S>[];
+ 
+ 		[name: string]: any;
+ 	}
+@@ -967,6 +971,9 @@ declare namespace Moleculer {
+ 		options?: GenericObject;
+ 	}
+ 
++	type BrokerSyncLifecycleHandler = (broker: ServiceBroker) => void;
++	type BrokerAsyncLifecycleHandler = (broker: ServiceBroker) => void | Promise<void>;
++
+ 	interface BrokerOptions {
+ 		namespace?: string | null;
+ 		nodeID?: string | null;
+@@ -1030,9 +1037,9 @@ declare namespace Moleculer {
+ 		ContextFactory?: typeof Context;
+ 		Promise?: PromiseConstructorLike;
+ 
+-		created?: (broker: ServiceBroker) => void;
+-		started?: (broker: ServiceBroker) => void;
+-		stopped?: (broker: ServiceBroker) => void;
++		created?: BrokerSyncLifecycleHandler;
++		started?: BrokerAsyncLifecycleHandler;
++		stopped?: BrokerAsyncLifecycleHandler;
+ 
+ 		/**
+ 		 * If true, process.on("beforeExit/exit/SIGINT/SIGTERM", ...) handler won't be registered!
+@@ -1421,7 +1428,7 @@ declare namespace Moleculer {
+ 	interface RedisCacherOptions extends CacherOptions {
+ 		prefix?: string;
+ 		redis?: GenericObject;
+-		redlock?: GenericObject;
++		redlock?: boolean | GenericObject;
+ 		monitor?: boolean;
+ 		pingInterval?: number;
+ 	}
+diff --git a/src/cachers/redis.js b/src/cachers/redis.js
+index 4cb7021b9a53b19e9492c743f4ef3e43f0566483..2e896f8277a4f96ea0765b0908df8f1b0a25b165 100644
+--- a/src/cachers/redis.js
++++ b/src/cachers/redis.js
+@@ -6,7 +6,7 @@
+ 
+ "use strict";
+ 
+-let Redis, Redlock;
++let Redis;
+ const BaseCacher = require("./base");
+ const _ = require("lodash");
+ const { METRIC } = require("../metrics");
+@@ -38,6 +38,13 @@ class RedisCacher extends BaseCacher {
+ 		});
+ 
+ 		this.pingIntervalHandle = null;
++
++		/**
++		 * Redlock client instance
++		 * @memberof RedisCacher
++		 */
++		this.redlock = null;
++		this.redlockNonBlocking = null;
+ 	}
+ 
+ 	/**
+@@ -94,27 +101,26 @@ class RedisCacher extends BaseCacher {
+ 			/* istanbul ignore next */
+ 			this.logger.error(err);
+ 		});
+-		try {
+-			Redlock = require("redlock");
+-		} catch (err) {
+-			/* istanbul ignore next */
+-			this.logger.warn(
+-				"The 'redlock' package is missing. If you want to enable cache lock, please install it with 'npm install redlock --save' command."
+-			);
+-		}
+-		if (Redlock) {
+-			let redlockClients = (this.opts.redlock ? this.opts.redlock.clients : null) || [
+-				this.client
+-			];
+-			/**
+-			 * redlock client instance
+-			 * @memberof RedisCacher
+-			 */
+-			this.redlock = new Redlock(redlockClients, _.omit(this.opts.redlock, ["clients"]));
+-			// Non-blocking redlock client, used for tryLock()
+-			this.redlockNonBlocking = new Redlock(redlockClients, {
+-				retryCount: 0
+-			});
++
++		// check for !== false for backwards compatibility purposes; should be changed to opt-in in a breaking change release
++		if (this.opts.redlock !== false) {
++			let Redlock;
++			try {
++				Redlock = require("redlock");
++			} catch (err) {
++				Redlock = null;
++			}
++			if (Redlock != null) {
++				let redlockClients = (this.opts.redlock ? this.opts.redlock.clients : null) || [
++					this.client
++				];
++
++				this.redlock = new Redlock(redlockClients, _.omit(this.opts.redlock, ["clients"]));
++				// Non-blocking redlock client, used for tryLock()
++				this.redlockNonBlocking = new Redlock(redlockClients, {
++					retryCount: 0
++				});
++			}
+ 		}
+ 		if (this.opts.monitor) {
+ 			/* istanbul ignore next */
+@@ -344,6 +350,10 @@ class RedisCacher extends BaseCacher {
+ 	 * @memberof RedisCacher
+ 	 */
+ 	lock(key, ttl = 15000) {
++		if (this.redlock == null) {
++			return this._handleMissingRedlock();
++		}
++
+ 		key = this.prefix + key + "-lock";
+ 		return this.redlock.lock(key, ttl).then(lock => {
+ 			return () => lock.unlock();
+@@ -360,12 +370,27 @@ class RedisCacher extends BaseCacher {
+ 	 * @memberof RedisCacher
+ 	 */
+ 	tryLock(key, ttl = 15000) {
++		if (this.redlockNonBlocking == null) {
++			return this._handleMissingRedlock();
++		}
++
+ 		key = this.prefix + key + "-lock";
+ 		return this.redlockNonBlocking.lock(key, ttl).then(lock => {
+ 			return () => lock.unlock();
+ 		});
+ 	}
+ 
++	/**
++	 * Common code for handling unavailable Redlock
++	 * @returns {Promise}
++	 */
++	_handleMissingRedlock() {
++		this.logger.error(
++			"The 'redlock' package is missing or redlock is disabled. If you want to enable cache lock, please install it with 'npm install redlock --save' command."
++		);
++		return Promise.resolve();
++	}
++
+ 	_sequentialPromises(elements) {
+ 		return elements.reduce((chain, element) => {
+ 			return chain.then(() => this._scanDel(element));
